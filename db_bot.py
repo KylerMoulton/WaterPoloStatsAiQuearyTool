@@ -4,123 +4,162 @@ import os
 import sqlite3
 from time import time
 
-print("Running db_bot.py!")
+print("Running db_bot.py for Utah Club Water Polo!")
 
+# File paths
 fdir = os.path.dirname(__file__)
 def getPath(fname):
     return os.path.join(fdir, fname)
 
-# SQLITE
 sqliteDbPath = getPath("aidb.sqlite")
 setupSqlPath = getPath("setup.sql")
 setupSqlDataPath = getPath("setupData.sql")
 
-# Erase previous db
+# Remove old database
 if os.path.exists(sqliteDbPath):
     os.remove(sqliteDbPath)
 
-sqliteCon = sqlite3.connect(sqliteDbPath) # create new db
+# Connect to SQLite
+sqliteCon = sqlite3.connect(sqliteDbPath)
 sqliteCursor = sqliteCon.cursor()
-with (
-        open(setupSqlPath) as setupSqlFile,
-        open(setupSqlDataPath) as setupSqlDataFile
-    ):
 
-    setupSqlScript = setupSqlFile.read()
-    setupSQlDataScript = setupSqlDataFile.read()
+# Load schema and seed data
+with open(setupSqlPath) as f:
+    setupSqlScript = f.read()
+with open(setupSqlDataPath) as f:
+    setupSqlDataScript = f.read()
 
-sqliteCursor.executescript(setupSqlScript) # setup tables and keys
-sqliteCursor.executescript(setupSQlDataScript) # setup tables and keys
+sqliteCursor.executescript(setupSqlScript)
+sqliteCursor.executescript(setupSqlDataScript)
 
 def runSql(query):
-    result = sqliteCursor.execute(query).fetchall()
-    return result
+    """Run a single SQL statement and return results, handling errors."""
+    try:
+        result = sqliteCursor.execute(query).fetchall()
+        sqliteCon.commit()
+        return result
+    except Exception as e:
+        print(f"SQL Error: {e}")
+        return None  # Return None on error instead of empty list
 
-# OPENAI
+# OpenAI setup
 configPath = getPath("config.json")
-print(configPath)
-with open(configPath) as configFile:
-    config = json.load(configFile)
+with open(configPath) as f:
+    config = json.load(f)
 
-openAiClient = OpenAI(api_key = config["openaiKey"])
-openAiClient.models.list() # check if the key is valid (update in config.json)
+openAiClient = OpenAI(api_key=config["openaiKey"])
+openAiClient.models.list()  # validate key
 
 def getChatGptResponse(content):
+    """Get GPT response in streaming mode."""
     stream = openAiClient.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": content}],
         stream=True,
     )
-
-    responseList = []
+    response = []
     for chunk in stream:
         if chunk.choices[0].delta.content is not None:
-            responseList.append(chunk.choices[0].delta.content)
-
-    result = "".join(responseList)
-    return result
-
-
-# strategies
-commonSqlOnlyRequest = " Give me a sqlite select statement that answers the question. Only respond with sqlite syntax. If there is an error do not explain it!"
-strategies = {
-    "zero_shot": setupSqlScript + commonSqlOnlyRequest,
-    "single_domain_double_shot": (setupSqlScript +
-                   " Who doesn't have a way for us to text them? " +
-                   " \nSELECT p.person_id, p.name\nFROM person p\nLEFT JOIN phone ph ON p.person_id = ph.person_id AND ph.can_recieve_sms = 1\nWHERE ph.phone_id IS NULL;\n " +
-                   commonSqlOnlyRequest)
-}
-
-questions = [
-    "Which are the most awarded dogs?",
-    # "Which dogs have multiple owners?",
-    # "Which people have multiple dogs?",
-    # "What are the top 3 cities represented?",
-    # "What are the names and cities of the dogs who have awards?",
-    # "Who has more than one phone number?",
-    "Who doesn't have a way for us to text them?",
-    "Will we have a problem texting any of the previous award winners?"
-    # "I need insert sql into my tables can you provide good unique data?"
-]
+            response.append(chunk.choices[0].delta.content)
+    return "".join(response)
 
 def sanitizeForJustSql(value):
+    """Extract the SQL code from GPT response, remove garbage lines."""
     gptStartSqlMarker = "```sql"
     gptEndSqlMarker = "```"
     if gptStartSqlMarker in value:
         value = value.split(gptStartSqlMarker)[1]
     if gptEndSqlMarker in value:
         value = value.split(gptEndSqlMarker)[0]
+    # Remove lines that are empty or comment-only
+    lines = value.splitlines()
+    lines = [line for line in lines if line.strip() and not line.strip().startswith('--')]
+    return "\n".join(lines).strip()
 
-    return value
+# Strategies: now water polo oriented
+commonSqlOnlyRequest = (
+    " Give me a sqlite select statement that answers the question. "
+    "Only respond with sqlite syntax. Do not combine multiple statements! "
+    "Do not explain errors."
+)
 
-for strategy in strategies:
-    responses = {"strategy": strategy, "prompt_prefix": strategies[strategy]}
+strategies = {
+    "zero_shot": setupSqlScript + commonSqlOnlyRequest,
+    "team_data_shot": (
+        setupSqlScript +
+        " Who are the top 5 scorers this season? Include goals, assists, and total shots. " +
+        commonSqlOnlyRequest
+    ),
+    "match_analysis_shot": (
+        setupSqlScript +
+        " Analyze the current season's matches. List the top 5 highest scoring matches and biggest margins of victory. " +
+        commonSqlOnlyRequest
+    ),
+    "player_stats_shot": (
+        setupSqlScript +
+        " Provide player-specific stats for the season. Limit to top 5 for goals, assists, steals, blocks, and exclusions. " +
+        commonSqlOnlyRequest
+    )
+}
+
+# Water polo top-5 questions
+questions = [
+    "Which teams have the most wins this season (top 5)?",
+    "Who are the top 5 scorers across all teams?",
+    "Which 5 matches had the largest winning margins?",
+    "Which 5 referees officiated the most matches?"
+]
+
+# Run strategies and queries
+for strategy_name, strategy_prefix in strategies.items():
+    responses = {"strategy": strategy_name, "prompt_prefix": strategy_prefix}
     questionResults = []
-    print("########################################################################")
-    print(f"Running strategy: {strategy}")
-    for question in questions:
 
-        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-        print("Question:")
-        print(question)
-        error = "None"
+    print("#" * 80)
+    print(f"Running strategy: {strategy_name}")
+
+    for question in questions:
+        print("~" * 80)
+        print(f"Question: {question}")
+
+        sqlSyntaxResponse = ""
+        queryRawResponse = ""
+        friendlyResponse = ""
+        error = None
+
         try:
-            getSqlFromQuestionEngineeredPrompt = strategies[strategy] + " " + question
-            sqlSyntaxResponse = getChatGptResponse(getSqlFromQuestionEngineeredPrompt)
+            # Get GPT SQL
+            prompt = strategy_prefix + " " + question
+            sqlSyntaxResponse = getChatGptResponse(prompt)
             sqlSyntaxResponse = sanitizeForJustSql(sqlSyntaxResponse)
             print("SQL Syntax Response:")
             print(sqlSyntaxResponse)
-            queryRawResponse = str(runSql(sqlSyntaxResponse))
-            print("Query Raw Response:")
-            print(queryRawResponse)
-            friendlyResultsPrompt = "I asked a question \"" + question +"\" and the response was \""+queryRawResponse+"\" Please, just give a concise response in a more friendly way? Please do not give any other suggests or chatter."
-            # betterFriendlyResultsPrompt = "I asked a question: \"" + question +"\" and I queried this database " + setupSqlScript + " with this query " + sqlSyntaxResponse + ". The query returned the results data: \""+queryRawResponse+"\". Could you concisely answer my question using the results data?"
-            friendlyResponse = getChatGptResponse(friendlyResultsPrompt)
-            print("Friendly Response:")
-            print(friendlyResponse)
-        except Exception as err:
-            error = str(err)
-            print(err)
+
+            # Run SQL if it exists
+            if sqlSyntaxResponse:
+                result = runSql(sqlSyntaxResponse)
+                if result is None:
+                    queryRawResponse = "SQL Error occurred"
+                    friendlyResponse = f"Could not retrieve data for: {question}"
+                elif result == []:
+                    queryRawResponse = "[]"
+                    friendlyResponse = f"No data found for: {question}"
+                else:
+                    queryRawResponse = str(result)
+                    friendlyPrompt = (
+                        f"I asked: '{question}' and the query returned: '{queryRawResponse}'. "
+                        "Please provide a concise, friendly answer without extra chatter."
+                    )
+                    friendlyResponse = getChatGptResponse(friendlyPrompt)
+            else:
+                queryRawResponse = "No SQL generated"
+                friendlyResponse = f"GPT did not generate SQL for: {question}"
+
+        except Exception as e:
+            error = str(e)
+            print(f"Error: {error}")
+            queryRawResponse = "Exception"
+            friendlyResponse = f"Error occurred: {error}"
 
         questionResults.append({
             "question": question,
@@ -132,9 +171,10 @@ for strategy in strategies:
 
     responses["questionResults"] = questionResults
 
-    with open(getPath(f"response_{strategy}_{time()}.json"), "w") as outFile:
-        json.dump(responses, outFile, indent = 2)
-
+    # Save response JSON
+    filename = f"response_{strategy_name}_{int(time())}.json"
+    with open(getPath(filename), "w") as f:
+        json.dump(responses, f, indent=2)
 
 sqliteCursor.close()
 sqliteCon.close()
